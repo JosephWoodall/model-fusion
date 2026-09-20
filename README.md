@@ -176,6 +176,13 @@ Predicted knee: interference `max_k Σ_{j≠k} tr(A_kA_j)/tr(A_k²)` = 1.0, i.e.
 time, worst-task accuracy is 0.021 below it and 0.020 above — chance everywhere. At `N=2` the
 solver is *provably at the floor* with a 17 dB interference margin and the merge is still dead.
 
+![Merge degradation against energy-weighted interference](docs/img/capacity_d128.png)
+
+The ceiling is flat at 1.0, every merge is flat at chance, and the line at 1.0 is crossed without
+anything happening. Hollow red markers are cells where the solver finished above the rearrangement
+floor, so their overlap reflects the optimizer rather than the spectra and nothing about capacity
+follows from them. Only `N=2` is attributable — and it is the cell with a 17 dB margin.
+
 ### Two bugs the instrumentation caught
 
 Both produced the signature of a capacity limit while having nothing to do with capacity.

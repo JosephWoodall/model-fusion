@@ -238,6 +238,13 @@ For the first time both sides of the predicted knee are populated — and there
 is **no knee**. 0.021 below, 0.020 above. At `N=2` the solver is provably at the
 floor with a 17 dB interference margin, and the merge is still at chance.
 
+![Merge degradation against energy-weighted interference](img/capacity_d128.png)
+
+Hollow markers are cells where the solver finished above the floor; their
+overlap reflects the optimizer, not the spectra, so nothing about capacity
+follows from them. `N=2` is the one attributable cell, and it is the one with
+the largest margin.
+
 ### Bug 1 — the combine rule was broken independently of any geometry
 
 Writers were summed while readers were averaged, so readers were scaled by
