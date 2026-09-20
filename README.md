@@ -52,7 +52,8 @@ Pairwise alignment to a reference model is order-dependent and O(N²). Instead e
 
 | Component | Exploitable freedom | Method |
 |-----------|--------------------|--------|
-| Residual stream | `O(d)` | Orthogonal Procrustes on the shared-vocabulary embeddings, iterating the consensus target |
+| Residual stream, on the anchor span | `O(d)` | Orthogonal Procrustes on `[E; P; Uᵀ]` — every matrix whose rows are in the shared token basis — iterating the consensus target |
+| Residual stream, off it | `O(d − r)` | Diagonalize the residual activation covariance restricted to the complement; sign-fix by skewness |
 | Attention heads | `GL(d_head)`, not just permutation | SVD of the QK circuit `W_Q W_Kᵀ` and the OV circuit `W_V W_O`; rotate to singular-vector coordinates, then Hungarian across heads |
 | MLP hidden units | Permutation + positive scaling | Normalize rows to fix scale, match by activation correlation |
 
@@ -60,13 +61,21 @@ Head canonicalization is *exact*: attention depends on `W_Q` and `W_K` only thro
 and on `W_V`, `W_O` only through the OV circuit, so rewriting each circuit in its own singular
 basis changes no function value.
 
+**The second row is not in the original plan and it is the difference between the method working
+and not working.** Procrustes on the embeddings pins the frame only on the span of the anchor
+matrices — at most `V + T` directions. At `d=128` with `V=51` that leaves 71 directions
+undetermined, and *those directions carry 55% of the residual energy at layers 1 and 2*, because
+attention and MLP outputs write wherever they like. The symptom is embedding disagreement falling
+to `1e-17` while the interpolation barrier does not move. See
+[`docs/FINDINGS.md`](docs/FINDINGS.md).
+
 ## Phases
 
 | Phase | Content | Status |
 |-------|---------|--------|
 | 0 | Testbed: bias-free RMSNorm transformer, task suite with a relatedness dial, same-task/different-seed control | implemented |
-| 1 | Canonicalization: Procrustes, head and MLP canonicalization; baselines (Git Re-Basin, activation matching, OT/Sinkhorn, ZipIt!) | implemented |
-| 2 | Capacity-aware fusion: effective rank, Stiefel-manifold subspace disentangling, budgeted merge | implemented |
+| 1 | Canonicalization: anchor Procrustes + complement pinning, head and MLP canonicalization; baselines (Git Re-Basin, activation matching, OT/Sinkhorn, ZipIt!) | implemented, **validated** |
+| 2 | Capacity-aware fusion: effective rank, Stiefel-manifold subspace disentangling, budgeted merge | implemented, knee **not yet located** |
 | 3 | Repair: REPAIR-style renormalization, refitting only the RMSNorm gains | implemented |
 | 4 | Evaluation grid and reference points | implemented |
 | 5 | Mechanistic verification: read the Fourier features for modular arithmetic directly out of the merged weights | implemented |
@@ -74,15 +83,78 @@ basis changes no function value.
 See [`docs/PLAN.md`](docs/PLAN.md) for the full program and [`docs/DESIGN.md`](docs/DESIGN.md)
 for the invariants the code is required to preserve.
 
-## Order of attack
-
-Phase 0 plus Procrustes-on-embeddings, tested on **same-task/different-seed** pairs, is the
-go/no-go. If the interpolation barrier does not collapse there, alignment is broken and nothing
-downstream means anything — stop and fix it before touching capacity or repair.
+## The go/no-go, in two controls
 
 ```bash
-python -m experiments.exp0_sanity          # train 2 same-task models, align, check the barrier
+python -m experiments.exp0_sanity
 ```
+
+One control is not enough, and finding that out is the first result this repo produced.
+
+**Control A — pure frame difference.** A trained model against an exactly rotated copy of itself.
+The two are the same function in different coordinates, so a working canonicalizer must drive the
+interpolation barrier to *zero*. This tests the machinery and nothing else.
+
+**Control B — same task, different seeds.** The real question.
+
+Run on this testbed:
+
+| | Control A | Control B |
+|---|---|---|
+| interpolation barrier | 4.74 → **0.000000** | 4.69 → 6.57 |
+| worst parameter difference after alignment | 6e-6 (float32 noise) | — |
+
+Control A passing while Control B does not is *not* an alignment failure, and the mechanistic
+readout says what it is instead: the two seeds grokked **different Fourier frequencies**
+(`[1,7,11,18,23]` vs `[1,13,16,22]`). They compute the same function through different circuits,
+and no element of `O(d)` maps one onto the other. CKA agrees independently, and CKA cannot be
+moved by alignment.
+
+So the gate is:
+
+- Control A fails → the aligner is broken. Fix it.
+- Control A passes, Control B fails → solution diversity. That is a **capacity** question, and
+  whether two circuits fit is exactly what `Σr_k ≤ d` decides.
+- Both pass → proceed.
+
+Run as originally specified — Control B alone — this test would have sent us to fix an aligner
+that is provably exact.
+
+## What the baselines are worth
+
+`python -m experiments.exp1_alignment_baselines` — merged accuracy after each alignment method,
+then averaging. Chance is 0.021.
+
+| Method | Known frame difference | Independent seeds |
+|--------|-----------------------|-------------------|
+| naive average (floor) | 0.053 | 0.025 |
+| Git Re-Basin (weight matching) | 0.022 | 0.020 |
+| activation matching | 0.050 | 0.023 |
+| OT fusion (Sinkhorn) | 0.035 | 0.023 |
+| ZipIt! feature merging | 0.044 | 0.023 |
+| **canonicalization (this repo)** | **1.000** | 0.024 |
+
+Left column: every method is handed a difference it can in principle undo. Only the one that
+searches `O(d)` undoes it. Every permutation-based method stays at chance, because the difference
+is not a permutation. That gap is the concrete value of choosing the architecture for its symmetry
+group.
+
+Right column: nothing recovers anything, for the Control B reason above. Reported rather than
+omitted.
+
+## Measuring capacity without a magic number
+
+The capacity law needs a well-defined `r_k`. A thresholded effective rank is not one — measured
+here on a single modular-addition model at `d=128`:
+
+| energy threshold | 0.90 | 0.99 | 0.999 |
+|---|---|---|---|
+| effective rank | 39 | 98 | 124 |
+
+The threshold picks the answer, and with it the predicted knee. The **participation ratio**
+`(Σλ)² / Σλ²` has no such knob and lands at ~11 for the same model, which is where the energy
+actually is. It is the default (`FusionConfig.rank_measure`); the thresholded version is kept for
+comparison against the literature.
 
 ## Evaluation is adversarial on purpose
 
@@ -110,6 +182,13 @@ pip install -e ".[dev]"
 pytest -q            # invariance tests: the symmetry transforms must be exact
 ```
 
+## Results so far
+
+[`docs/FINDINGS.md`](docs/FINDINGS.md) is the running log, with the command for every number.
+Short version: Phase 1 is validated and exact; Phase 2's knee has not been located yet, because
+every cell run so far is already over capacity and the sweep needs to start from a feasible one.
+Nothing here yet shows a merge that works on independently trained models.
+
 ## Layout
 
 ```
@@ -123,7 +202,9 @@ src/fusion/
   repair.py         REPAIR-style gain refitting
   evaluation/       barrier, CKA, overlap, the grid harness
   baselines/        distillation, router, joint training
+  mechanistic.py    Fourier-circuit readout: superposed / overwritten / destroyed
 experiments/        runnable phase-by-phase scripts
+docs/               PLAN.md (the program), DESIGN.md (invariants), FINDINGS.md (results)
 ```
 
 ## References
