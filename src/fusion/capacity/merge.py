@@ -31,7 +31,15 @@ from ..config import FusionConfig
 from ..model import Transformer, require_same_arch
 from ..symmetry import apply_residual_rotation
 from .rank import RankProfile, participation_ratio, used_subspace
-from .stiefel import DisentangleResult, budget_qp, disentangle, subspace_overlap
+from .stiefel import (
+    KNEE,
+    DisentangleResult,
+    budget_qp,
+    disentangle,
+    interference_ratio,
+    rearrangement_floor,
+    subspace_overlap,
+)
 
 
 @dataclass
@@ -49,6 +57,11 @@ class CapacityReport:
     rank_energy: list[float] = field(default_factory=list)
     disentangled: bool = False
     combine: str = ""
+    weighted: bool = False
+    interference_before: float = float("nan")
+    interference_after: float = float("nan")
+    floor: float = float("nan")
+    at_floor: bool = False
 
     @property
     def rank_coverage(self) -> float:
@@ -60,6 +73,15 @@ class CapacityReport:
         return self.total_rank / self.d_model if self.d_model else float("nan")
 
     def __str__(self) -> str:
+        if self.weighted:
+            verdict = "below knee" if self.interference_after < KNEE else "ABOVE KNEE"
+            stalled = "" if self.at_floor else "  [above floor: solver, not capacity, is the limit]"
+            return (
+                f"weighted overlap {self.overlap_before:.4f} -> {self.overlap_after:.4f} "
+                f"(floor {self.floor:.4f}); interference {self.interference_before:.3f} -> "
+                f"{self.interference_after:.3f} ({verdict}); "
+                f"combine={self.combine}{stalled}"
+            )
         head = (
             f"sum(r_k)/d = {self.total_rank}/{self.d_model} = {self.ratio:.2f} "
             f"({'feasible' if self.feasible else 'OVER CAPACITY'})"
@@ -144,30 +166,52 @@ def fuse(
         used_subspace(m, t.to(m.embed.device), cfg.rank_threshold, cfg.rank_measure)
         for m, t in zip(models, calib_tokens, strict=True)
     ]
+    weighted = cfg.rank_measure == "full"
     report = CapacityReport(
         profiles=profiles,
         total_rank=sum(p.rank for p in profiles),
         d_model=models[0].cfg.d_model,
         participation=[participation_ratio(p.spectra[-1]) for p in profiles],
         rank_energy=[p.energy_captured for p in profiles],
+        weighted=weighted,
     )
     bases = [p.basis() for p in profiles]
-    report.overlap_before = subspace_overlap(bases)
-    report.feasible = report.total_rank <= report.d_model
+    # Under measure="full" the spectrum rides along with the basis and no cutoff
+    # is applied anywhere; that is the whole point of the weighted objective.
+    energies = [p.spectrum() for p in profiles] if weighted else None
+
+    report.overlap_before = subspace_overlap(bases, energies)
+    if weighted:
+        report.interference_before = interference_ratio(bases, energies)
+        report.floor = rearrangement_floor(energies)
+        report.feasible = report.interference_before < KNEE
+    else:
+        report.feasible = report.total_rank <= report.d_model
 
     if cfg.disentangle and len(models) > 1:
         res: DisentangleResult = disentangle(
-            bases, steps=cfg.stiefel_steps, lr=cfg.stiefel_lr, verbose=verbose
+            bases, energies, steps=cfg.stiefel_steps, lr=cfg.stiefel_lr, verbose=verbose
         )
         for m, R in zip(models, res.rotations, strict=True):
             apply_residual_rotation(m, R.to(m.embed), check=False)
         report.overlap_after = res.overlap_after
         report.disentangled = True
         bases = [R.to(b) @ b for R, b in zip(res.rotations, bases, strict=True)]
+        if weighted:
+            report.interference_after = res.interference_after
+            report.at_floor = res.at_floor
+            report.feasible = res.feasible
     else:
         report.overlap_after = report.overlap_before
+        report.interference_after = report.interference_before
 
-    if report.feasible:
+    if weighted:
+        # No rank budget exists any more, so there is nothing for the budget QP
+        # to select: every direction is already carried, weighted by its energy.
+        # Whether the sum survives is what the interference ratio reports.
+        merged = _sum_models(models)
+        report.combine = "sum"
+    elif report.feasible:
         # disjoint subspaces: the correct combination is the sum
         merged = _sum_models(models)
         report.combine = "sum"

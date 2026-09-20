@@ -56,8 +56,26 @@ def test_fuse_returns_a_usable_model_and_a_populated_report():
     assert report.d_model == cfg.d_model
     assert report.total_rank > 0
     assert report.combine in {"sum", "sum+budget-qp"}
-    assert report.feasible == (report.total_rank <= report.d_model)
     assert len(report.profiles) == len(models)
+
+
+def test_fuse_default_is_the_weighted_objective_with_no_cutoff():
+    models, _, calib, cfg = build()
+    merged, report = fuse(models, calib, FusionConfig(stiefel_steps=20))
+    assert report.weighted
+    assert report.combine == "sum"                       # no rank budget to spend
+    assert all(p.measure == "full" for p in report.profiles)
+    assert all(p.rank == cfg.d_model for p in report.profiles)
+    assert report.interference_after == report.interference_after   # not NaN
+    assert report.floor >= 0.0
+    assert report.feasible == (report.interference_after < 1.0)
+
+
+def test_fuse_with_a_cutoff_measure_still_uses_the_rank_criterion():
+    models, _, calib, _ = build()
+    _, report = fuse(models, calib, FusionConfig(stiefel_steps=20, rank_measure="participation"))
+    assert not report.weighted
+    assert report.feasible == (report.total_rank <= report.d_model)
 
 
 def test_fuse_requires_one_calibration_batch_per_model():

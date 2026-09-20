@@ -33,6 +33,8 @@ class RankProfile:
     threshold: float
     measure: str = "participation"
     captured: list[float] = field(default_factory=list)   # energy fraction inside each basis
+    pooled_basis: Tensor | None = None    # [d, d] eigenvectors of the pooled covariance
+    pooled_spectrum: Tensor | None = None  # [d] eigenvalues, descending
 
     @property
     def rank(self) -> int:
@@ -75,11 +77,32 @@ class RankProfile:
         Layers share one residual stream, so the directions a model occupies is
         the span of the union.  Pooling by SVD of the concatenated, energy-
         weighted bases keeps that honest rather than picking one layer.
+
+        Under ``measure="full"`` the pooled covariance eigenbasis is returned
+        directly, so that :meth:`spectrum` lines up column for column with it --
+        which the energy-weighted objective requires.
         """
+        if self.measure == "full" and self.pooled_basis is not None:
+            return self.pooled_basis
         stacked = torch.cat(self.bases, dim=1)
         U, S, _ = torch.linalg.svd(stacked, full_matrices=False)
         keep = int((S > S.max() * 1e-6).sum().item())
         return U[:, : min(keep, self.rank)]
+
+    def spectrum(self) -> Tensor:
+        """Eigenvalues matching :meth:`basis` column for column.
+
+        This is what makes the objective energy-weighted rather than
+        rank-thresholded: each direction is carried with the variance actually
+        on it.  Only meaningful under ``measure="full"``, where basis and
+        spectrum come from the same eigendecomposition; the cutoff measures
+        pool bases across layers by SVD, which severs that correspondence.
+        """
+        if self.pooled_spectrum is None:
+            raise RuntimeError(
+                "no pooled spectrum on this profile; build it with measure='full'"
+            )
+        return self.pooled_spectrum[: self.basis().shape[1]]
 
     def __str__(self) -> str:
         return (
@@ -127,24 +150,33 @@ def effective_rank(
 
     Returns ``(r, basis[d, r], eigenvalues)``.
 
-    ``measure="participation"`` (the default) uses the participation ratio
+    ``measure="full"`` keeps every direction and applies no cutoff at all; the
+    spectrum is then carried into the energy-weighted overlap objective, which
+    is how Phase 2 avoids having a cutoff decide its answer.  This is the
+    default for fusion.
+
+    ``measure="participation"`` uses the participation ratio
     ``(sum l)^2 / sum l^2``, rounded.  ``measure="threshold"`` counts the
     eigenvalues needed to reach ``threshold`` of the total energy.
 
-    **The default is not arbitrary.**  Measured on this testbed, the thresholded
-    rank of a single modular-addition model at ``d=128`` is 39, 98, or 124
-    depending on whether the threshold is 0.90, 0.99, or 0.999 -- so a capacity
-    law stated as ``sum_k r_k <= d`` would have its x-axis, and therefore its
-    predicted knee, set by an arbitrary constant.  The participation ratio has
-    no such knob and lands at ~11 for the same model, which is the number that
-    reflects where the activation energy actually is.  ``threshold`` is kept
-    available for comparison against the literature, which mostly uses it.
+    **Why "full" is the default.**  Both cutoffs turned out to be untestable
+    (``docs/FINDINGS.md``).  The thresholded rank of a single modular-addition
+    model at ``d=128`` is 39, 98, or 124 depending on whether the threshold is
+    0.90, 0.99, or 0.999, so ``sum_k r_k <= d`` has its predicted knee set by an
+    arbitrary constant.  The participation ratio has no knob but is far too
+    generous: its basis captured only 74-77% of activation energy, and
+    disentangling it to *exactly* zero overlap left the 99%-energy bases still
+    colliding at 0.77.  Carrying the whole spectrum and weighting by energy
+    removes the choice entirely.  Both cutoffs are kept for comparison, and
+    ``threshold`` is what most of the literature reports.
     """
     evals, evecs = torch.linalg.eigh(cov.double())
     order = torch.argsort(evals, descending=True)
     evals, evecs = evals[order].clamp_min(0), evecs[:, order]
 
-    if measure == "participation":
+    if measure == "full":
+        r = evals.numel()
+    elif measure == "participation":
         r = max(1, int(round(participation_ratio(evals))))
     elif measure == "threshold":
         if threshold >= 1.0:
@@ -176,15 +208,28 @@ def used_subspace(
     measure: str = "participation",
 ) -> RankProfile:
     """Full rank profile of a model on its own data."""
+    covs = activation_covariance(model, tokens)
     ranks, bases, spectra, captured = [], [], [], []
-    for cov in activation_covariance(model, tokens):
+    for cov in covs:
         r, basis, evals = effective_rank(cov, threshold, measure)
         ranks.append(r)
         bases.append(basis.to(model.embed.dtype))
         spectra.append(evals.to(model.embed.dtype))
         e = evals.clamp_min(0)
         captured.append(float(e[:r].sum() / e.sum().clamp_min(1e-30)))
+
+    # Pooled covariance, each layer trace-normalized so the last layer -- whose
+    # activations are largest -- does not decide the frame by itself.
+    pooled = torch.zeros_like(covs[0])
+    for cov in covs:
+        pooled = pooled + cov / cov.diagonal().sum().clamp_min(1e-30)
+    pooled = pooled / len(covs)
+    pe, pv = torch.linalg.eigh(pooled)
+    order = torch.argsort(pe, descending=True)
+
     return RankProfile(
         ranks=ranks, bases=bases, spectra=spectra, captured=captured,
         d_model=model.cfg.d_model, threshold=threshold, measure=measure,
+        pooled_basis=pv[:, order].to(model.embed.dtype),
+        pooled_spectrum=pe[order].clamp_min(0).to(model.embed.dtype),
     )

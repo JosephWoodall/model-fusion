@@ -1,12 +1,19 @@
 """Phase 2 — capacity-aware fusion. The contribution.
 
 Alignment says *where* the models' features live. Capacity says whether they
-*fit*. The falsifiable claim: a merge succeeds iff ``sum_k r_k <= d``.
+*fit*. The falsifiable claim, restated without a rank cutoff: a merge succeeds
+while the energy-weighted interference ratio stays below 1.0 (0 dB).
 """
 
 from .merge import CapacityReport, capacity_ratio, fuse, naive_average
 from .rank import RankProfile, activation_covariance, effective_rank, used_subspace
-from .stiefel import disentangle, subspace_overlap
+from .stiefel import (
+    KNEE,
+    disentangle,
+    interference_ratio,
+    rearrangement_floor,
+    subspace_overlap,
+)
 
 __all__ = [
     "RankProfile",
@@ -15,6 +22,9 @@ __all__ = [
     "used_subspace",
     "disentangle",
     "subspace_overlap",
+    "interference_ratio",
+    "rearrangement_floor",
+    "KNEE",
     "fuse",
     "naive_average",
     "capacity_ratio",

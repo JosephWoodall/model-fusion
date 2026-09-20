@@ -62,7 +62,10 @@ class FusionConfig:
     canonicalize_mlp: bool = True
 
     # Phase 2
-    rank_measure: str = "participation"   # "participation" (threshold-free) or "threshold"
+    # "full" carries the whole spectrum into an energy-weighted overlap objective
+    # and applies no cutoff at all; "participation" and "threshold" are the two
+    # cutoff measures, kept for comparison (see docs/FINDINGS.md).
+    rank_measure: str = "full"
     rank_threshold: float = 0.99          # energy fraction, used only by measure="threshold"
     stiefel_steps: int = 300
     stiefel_lr: float = 0.05

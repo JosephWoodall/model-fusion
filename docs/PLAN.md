@@ -75,20 +75,57 @@ of them. If it does not, that is informative and gets reported.
 ## Phase 2 — Capacity-aware fusion (the contribution)
 
 After alignment there is still residual `O(d)` freedom. Spend it making the models' *used*
-subspaces mutually orthogonal.
+directions mutually orthogonal.
+
+### The original formulation, and why it was replaced
 
 1. For each model `k` and layer, run that model's own task data and take the activation
-   covariance. Its effective rank `r_k` is the number of eigenvalues above threshold. Small models
-   on narrow tasks use far less than `d`; that slack is what makes this possible.
-2. Solve for orthogonal `R_k` minimizing pairwise subspace overlap
-   `Σ_{j≠k} ‖(R_k U_k)ᵀ (R_j U_j)‖²_F`, by Stiefel-manifold optimization (Cayley or QR
-   retraction).
-3. If `Σ_k r_k ≤ d` the subspaces can in principle be made disjoint and the merge is **literally a
-   sum**, with no interference. If `Σ_k r_k > d` the merge is over capacity and something must be
-   discarded — which is where an output-space QP earns its place: it picks the optimal corrections
-   under the budget, and the captured energy `ρ` reports how much was lost.
+   covariance. Its effective rank `r_k` is the number of eigenvalues above threshold.
+2. Solve for orthogonal `R_k` minimizing `Σ_{j≠k} ‖(R_k U_k)ᵀ (R_j U_j)‖²_F` by Stiefel-manifold
+   optimization.
+3. If `Σ_k r_k ≤ d` the subspaces can be made disjoint and the merge is a sum; otherwise an
+   output-space QP picks what to discard under the budget, reporting captured energy `ρ`.
 
-This yields the falsifiable capacity condition **merge succeeds iff Σ_k r_k ≤ d**.
+This yields the condition **merge succeeds iff `Σ_k r_k ≤ d`** — which turned out to be
+**untestable in both directions**. A thresholded `r_k` is set by its threshold (39 / 98 / 124 at
+0.90 / 0.99 / 0.999 for one model at `d=128`), so the predicted knee moves with an arbitrary
+constant. The threshold-free participation ratio is so generous that every configuration passes
+while every merge still collapses. Neither bracket contains a transition. See
+[`FINDINGS.md`](FINDINGS.md).
+
+### The energy-weighted formulation (current)
+
+Drop the cutoff and carry the whole spectrum. With `M_k = R_k U_k Λ_k^{1/2}` and
+`A_k = M_k M_kᵀ = R_k C_k R_kᵀ`:
+
+> minimize over orthogonal `R_1..R_N`:  `Σ_{j≠k} ‖M_kᵀ M_j‖²_F = Σ_{j≠k} tr(A_k A_j)`
+
+the Frobenius inner product between rotated covariances. No threshold appears anywhere: a
+direction contributes in proportion to the energy actually on it.
+
+Three numbers come out of the same traces:
+
+| Quantity | Definition | Role |
+|---|---|---|
+| weighted overlap | `Σ tr(A_kA_j) / Σ ‖A_k‖_F‖A_j‖_F` ∈ [0,1] | bounded, symmetric: the plotting axis |
+| **interference ratio** | `max_k Σ_{j≠k} tr(A_kA_j) / tr(A_k²)` | interference over signal, per model |
+| rearrangement floor | per-pair minimum by the rearrangement inequality | separates "solver stalled" from "collision unavoidable" |
+
+**The restated prediction: the knee is at interference = 1.0** — 0 dB, where interference power
+matches signal power in a model's own weighted frame. The max over `k`, not the mean, to match
+worst-task accuracy.
+
+The solver warm-starts by anti-aligning the spectra, which is *exactly optimal for N = 2*, and
+keeps the best of several restarts. Without that it stalls well above the floor, and a solver
+artifact would be indistinguishable from a capacity result.
+
+### Two ways the prediction can be wrong
+
+1. **Too permissive.** The metric is coherent-blind: `N` identical models score `N−1` yet merge
+   perfectly. A real knee well below 1.0 is the signature.
+2. **Wrong variable.** `C_j` is measured on model `j`'s data, but inside the merged model, model
+   `j`'s machinery sees model `k`'s inputs. The honest term is a cross-covariance — `O(N²)` to
+   measure, and it breaks the per-model structure. No knee anywhere implicates this.
 
 ---
 

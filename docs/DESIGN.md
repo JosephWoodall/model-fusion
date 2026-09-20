@@ -99,8 +99,14 @@ itself.
 
 | If this breaks | You see |
 |----------------|---------|
-| Alignment | Interpolation barrier stays high on the **same-task/different-seed** control |
-| Capacity | Barrier collapses on the control, but merged accuracy falls as `Σr_k/d` crosses 1 |
+| Alignment | Control A (model vs. a rotated copy) fails to reach a zero barrier |
+| Solution diversity | Control A passes, Control B (same task, different seeds) does not |
+| Solver | Disentangled overlap sits above the rearrangement floor — nothing is attributable |
+| Capacity | Solver at the floor, and merged accuracy falls as the interference ratio crosses 1 |
 | Repair | Merged activations have wrong scale; post-repair accuracy jumps back |
+
+The solver row matters as much as the others. An optimizer that stalls produces exactly the
+signature of a capacity limit — high residual overlap — so `DisentangleResult.at_floor` gates
+every capacity claim, and cells above the floor are drawn hollow in the headline plot.
 
 Pre- and post-repair numbers are always reported separately, for exactly this reason.
