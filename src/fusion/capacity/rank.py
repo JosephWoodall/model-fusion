@@ -14,7 +14,7 @@ responds to someone else's inputs.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from torch import Tensor
@@ -32,6 +32,7 @@ class RankProfile:
     d_model: int
     threshold: float
     measure: str = "participation"
+    captured: list[float] = field(default_factory=list)   # energy fraction inside each basis
 
     @property
     def rank(self) -> int:
@@ -41,6 +42,32 @@ class RankProfile:
     @property
     def mean_rank(self) -> float:
         return sum(self.ranks) / len(self.ranks) if self.ranks else 0.0
+
+    @property
+    def energy_captured(self) -> float:
+        """Fraction of activation energy inside the binding layer's basis.
+
+        **Read this before believing any rank.** A rank that captures 75% of the
+        energy is not a description of the subspace the model uses -- the other
+        25% is spread over directions that still carry the computation, and
+        making the *reported* subspaces disjoint leaves those colliding. That
+        is exactly the failure mode measured in ``docs/FINDINGS.md``: overlap
+        driven to 0.000 on participation-ratio bases while the 99%-energy bases
+        still overlapped at 0.77.
+        """
+        if not self.captured:
+            return float("nan")
+        return self.captured[self.ranks.index(self.rank)]
+
+    def warn_if_low_energy(self, floor: float = 0.95) -> str | None:
+        """A one-line caveat when the rank does not account for the activations."""
+        e = self.energy_captured
+        if e != e or e >= floor:
+            return None
+        return (
+            f"rank {self.rank} captures only {100 * e:.1f}% of activation energy; "
+            f"sum(r_k) <= d is not a meaningful capacity test at this coverage"
+        )
 
     def basis(self) -> Tensor:
         """A single basis for the model's used subspace, pooled across layers.
@@ -57,7 +84,8 @@ class RankProfile:
     def __str__(self) -> str:
         return (
             f"RankProfile(d={self.d_model}, measure={self.measure}, per-layer={self.ranks}, "
-            f"binding={self.rank}, mean={self.mean_rank:.1f})"
+            f"binding={self.rank}, mean={self.mean_rank:.1f}, "
+            f"energy={100 * self.energy_captured:.1f}%)"
         )
 
 
@@ -148,13 +176,15 @@ def used_subspace(
     measure: str = "participation",
 ) -> RankProfile:
     """Full rank profile of a model on its own data."""
-    ranks, bases, spectra = [], [], []
+    ranks, bases, spectra, captured = [], [], [], []
     for cov in activation_covariance(model, tokens):
         r, basis, evals = effective_rank(cov, threshold, measure)
         ranks.append(r)
         bases.append(basis.to(model.embed.dtype))
         spectra.append(evals.to(model.embed.dtype))
+        e = evals.clamp_min(0)
+        captured.append(float(e[:r].sum() / e.sum().clamp_min(1e-30)))
     return RankProfile(
-        ranks=ranks, bases=bases, spectra=spectra,
+        ranks=ranks, bases=bases, spectra=spectra, captured=captured,
         d_model=model.cfg.d_model, threshold=threshold, measure=measure,
     )

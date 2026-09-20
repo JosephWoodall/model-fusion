@@ -125,7 +125,6 @@ Reported rather than omitted.
 
 ## Open questions
 
-- Does the knee in degradation actually land at `Σr_k/d = 1.0`? (`exp2_capacity`)
 - Solution diversity is the binding constraint at `d=128`. Does it shrink at
   larger `d`, or is it intrinsic to grokking modular arithmetic?
 - Does training the N specialists from a **shared initialization** remove the
@@ -134,3 +133,75 @@ Reported rather than omitted.
 - `diagnose_merge` reports "superposed" on merges whose accuracy is at chance:
   the embedding Fourier structure survives but the circuit consuming it does
   not. A downstream-circuit diagnostic is needed to close that gap.
+- An energy-weighted overlap objective that removes the rank cutoff from the
+  method entirely — see the Phase 2 entry below. This is the next thing to
+  build.
+
+---
+
+## 2026-09-20 — Phase 2: the capacity law is not yet testable, and the blocker is `r_k`
+
+`python -m experiments.exp2_capacity --steps 1000 --n 2 3 4 6 8 --d 256`
+
+### The sweep
+
+Participation-ratio rank, `d=256`, high overlap. Chance is 0.021.
+
+| N | Σr/d | feasible | overlap after disentangling | naive | fused | +repair | ceiling |
+|---|------|----------|------------------------------|-------|-------|---------|---------|
+| 2 | 0.18 | yes | 0.0000 | 0.026 | 0.030 | 0.028 | 1.000 |
+| 3 | 0.27 | yes | 0.0000 | 0.021 | 0.020 | 0.019 | 1.000 |
+| 4 | 0.33 | yes | 0.0000 | 0.016 | 0.017 | 0.018 | 1.000 |
+| 6 | 0.50 | yes | 0.0000 | 0.021 | 0.019 | 0.019 | 1.000 |
+| 8 | 0.67 | yes | 0.0000 | 0.019 | 0.012 | 0.019 | 1.000 |
+
+Every cell satisfies `Σr_k ≤ d`. The Stiefel solver drives pairwise subspace
+overlap to **exactly zero** — the reported subspaces really are made mutually
+orthogonal. And every merge is at chance.
+
+Taken at face value this falsifies the capacity law. It does not, and the reason
+matters more than the result.
+
+### The rank measure is too generous
+
+At `d=64`, `p=13`, two specialists:
+
+| | rank | Σr/d | overlap after disentangling on these bases |
+|---|---|---|---|
+| participation ratio | 9, 10 | 0.30 | **0.000000** |
+| 0.99 energy threshold | 49, 50 | 1.55 | 0.772 |
+
+The participation-ratio basis captures only **74–77% of the final-layer
+activation energy**. Making *that* subspace disjoint leaves the remaining
+quarter of the energy — spread over ~40 further directions — colliding exactly
+as before. The disentangling is real; it is disentangling the wrong thing.
+
+So the two available rank measures bracket the problem without solving it:
+
+- **participation ratio** — threshold-free, but so generous that every
+  configuration is "feasible" and the law predicts nothing;
+- **0.99 energy threshold** — knob-dependent (39 / 98 / 124 at 0.90 / 0.99 /
+  0.999 for one model at `d=128`), and so strict that no configuration is ever
+  feasible, so the law again predicts nothing.
+
+Neither bracket contains a knee, because neither contains a transition.
+**`Σr_k ≤ d` is untested, not confirmed and not refuted.**
+
+### Guard added
+
+`RankProfile.energy_captured` now reports what fraction of activation energy a
+rank actually accounts for, and `CapacityReport.__str__` prints a `CAVEAT` line
+whenever it drops below 95%. A rank that covers three quarters of the energy
+should never again be quoted as if it described the subspace the model uses.
+
+### What would actually test the law
+
+1. A rank measure that is threshold-free **and** energy-complete. The overlap
+   objective does not need a hard rank at all — it can be weighted by the
+   eigenvalues, minimizing `Σ_{j≠k} ‖(R_k U_k Λ_k^½)ᵀ(R_j U_j Λ_j^½)‖²_F` over
+   the *full* spectrum. That removes the cutoff from the method entirely.
+2. Once that exists, the x-axis should be energy-weighted overlap rather than a
+   counted ratio, and the prediction restated against it.
+3. Only then does the `Σr_k/d = 1` knee become a claim that can fail.
+
+Until then the headline plot has no defensible x-axis and is not reported.

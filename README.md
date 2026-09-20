@@ -142,19 +142,38 @@ group.
 Right column: nothing recovers anything, for the Control B reason above. Reported rather than
 omitted.
 
-## Measuring capacity without a magic number
+## Capacity: the law is untested, and the blocker is `r_k`
 
-The capacity law needs a well-defined `r_k`. A thresholded effective rank is not one — measured
-here on a single modular-addition model at `d=128`:
+The capacity law needs a well-defined `r_k`. Neither available measure is one.
+
+A **thresholded** effective rank is set by its threshold — one modular-addition model at `d=128`:
 
 | energy threshold | 0.90 | 0.99 | 0.999 |
 |---|---|---|---|
 | effective rank | 39 | 98 | 124 |
 
-The threshold picks the answer, and with it the predicted knee. The **participation ratio**
-`(Σλ)² / Σλ²` has no such knob and lands at ~11 for the same model, which is where the energy
-actually is. It is the default (`FusionConfig.rank_measure`); the thresholded version is kept for
-comparison against the literature.
+The knob picks the answer, and with it the predicted knee. The **participation ratio**
+`(Σλ)² / Σλ²` has no knob and lands at ~11 for the same model — but it is far too generous. At
+`d=64` the participation basis captures only **75% of activation energy**, and disentangling it
+to *exactly zero* overlap leaves the 99%-energy bases still overlapping at 0.77.
+
+Measured consequence, `d=256`, participation-ratio rank (chance = 0.021):
+
+| N | Σr/d | feasible | overlap after disentangling | fused | ceiling |
+|---|------|----------|------------------------------|-------|---------|
+| 2 | 0.18 | yes | 0.0000 | 0.030 | 1.000 |
+| 4 | 0.33 | yes | 0.0000 | 0.017 | 1.000 |
+| 8 | 0.67 | yes | 0.0000 | 0.012 | 1.000 |
+
+Every cell passes the capacity test, the subspaces really are made mutually orthogonal, and every
+merge is at chance. The strict measure has the mirror problem: no cell is ever feasible. Neither
+bracket contains a transition, so **`Σr_k ≤ d` is neither confirmed nor refuted here** and the
+headline knee plot has no defensible x-axis yet.
+
+`RankProfile.energy_captured` now reports what fraction of activation energy any rank accounts
+for, and the capacity report prints a `CAVEAT` below 95%. The next step is an energy-weighted
+overlap objective that removes the cutoff from the method entirely — see
+[`docs/FINDINGS.md`](docs/FINDINGS.md).
 
 ## Evaluation is adversarial on purpose
 
@@ -185,9 +204,13 @@ pytest -q            # invariance tests: the symmetry transforms must be exact
 ## Results so far
 
 [`docs/FINDINGS.md`](docs/FINDINGS.md) is the running log, with the command for every number.
-Short version: Phase 1 is validated and exact; Phase 2's knee has not been located yet, because
-every cell run so far is already over capacity and the sweep needs to start from a feasible one.
-Nothing here yet shows a merge that works on independently trained models.
+
+- **Phase 1 is validated and exact.** A planted rotation is recovered to float32 precision and the
+  barrier goes to 0.000000, which no permutation-based baseline comes close to.
+- **Phase 2's central claim is untested**, blocked on a rank measure that is simultaneously
+  threshold-free and energy-complete.
+- **No merge in this repo yet works on independently trained models.** Every one sits at chance.
+  That is the honest state, and the diagnostics say which phase to look at next.
 
 ## Layout
 

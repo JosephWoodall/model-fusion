@@ -46,8 +46,14 @@ class CapacityReport:
     feasible: bool = False
     captured_energy: float = float("nan")
     participation: list[float] = field(default_factory=list)
+    rank_energy: list[float] = field(default_factory=list)
     disentangled: bool = False
     combine: str = ""
+
+    @property
+    def rank_coverage(self) -> float:
+        """Worst per-model energy coverage of the bases the capacity test used."""
+        return min(self.rank_energy) if self.rank_energy else float("nan")
 
     @property
     def ratio(self) -> float:
@@ -60,7 +66,11 @@ class CapacityReport:
         )
         mid = f"overlap {self.overlap_before:.4f} -> {self.overlap_after:.4f}"
         tail = "" if self.feasible else f", captured energy rho = {self.captured_energy:.3f}"
-        return f"{head}; {mid}; combine={self.combine}{tail}"
+        out = f"{head}; {mid}; combine={self.combine}{tail}"
+        warnings = [w for p in self.profiles if (w := p.warn_if_low_energy())]
+        if warnings:
+            out += f"\n    CAVEAT: {warnings[0]}"
+        return out
 
 
 @torch.no_grad()
@@ -139,6 +149,7 @@ def fuse(
         total_rank=sum(p.rank for p in profiles),
         d_model=models[0].cfg.d_model,
         participation=[participation_ratio(p.spectra[-1]) for p in profiles],
+        rank_energy=[p.energy_captured for p in profiles],
     )
     bases = [p.basis() for p in profiles]
     report.overlap_before = subspace_overlap(bases)
