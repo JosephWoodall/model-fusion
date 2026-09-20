@@ -125,6 +125,44 @@ def residual_states(model: Transformer, tokens: Tensor) -> list[Tensor]:
 
 
 @torch.no_grad()
+def read_point_states(model: Transformer, tokens: Tensor) -> list[Tensor]:
+    """Residual stream at every point where a matrix *reads* from it.
+
+    Order is ``[block0.ln_attn, block0.ln_mlp, block1.ln_attn, ..., ln_f]`` --
+    ``2 * n_layers + 1`` tensors of ``[B, T, d]``, matching
+    :meth:`fusion.model.Transformer.norms`.
+
+    Layer boundaries are not the right places to measure for a merge: the
+    attention block and the MLP block of the same layer read the stream at
+    *different* points, because the MLP sees the attention output added in.  A
+    projector built from layer-boundary statistics is therefore the wrong
+    projector for half the readers.
+    """
+    model.eval()
+    x = model.embed[tokens] + model.pos[: tokens.shape[1]]
+    out = []
+    for block in model.blocks:
+        out.append(x)                       # ln_attn reads here
+        x = x + block.attn(block.ln_attn(x))
+        out.append(x)                       # ln_mlp reads here
+        x = x + block.mlp(block.ln_mlp(x))
+    out.append(x)                           # ln_f reads here
+    return out
+
+
+@torch.no_grad()
+def read_point_covariance(model: Transformer, tokens: Tensor, center: bool = True) -> list[Tensor]:
+    """Covariance at each read point, in the order of :func:`read_point_states`."""
+    covs = []
+    for h in read_point_states(model, tokens):
+        flat = h.reshape(-1, h.shape[-1]).double()
+        if center:
+            flat = flat - flat.mean(0, keepdim=True)
+        covs.append(flat.T @ flat / max(1, flat.shape[0]))
+    return covs
+
+
+@torch.no_grad()
 def activation_covariance(model: Transformer, tokens: Tensor, center: bool = True) -> list[Tensor]:
     """Residual-stream covariance at each layer: ``n_layers+1`` matrices of ``[d, d]``.
 

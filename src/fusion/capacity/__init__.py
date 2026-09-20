@@ -5,6 +5,14 @@ Alignment says *where* the models' features live. Capacity says whether they
 while the energy-weighted interference ratio stays below 1.0 (0 dB).
 """
 
+from .functional import (
+    FunctionalRank,
+    capacity_verdict,
+    energy_basis,
+    functional_rank,
+    restrict_to,
+)
+from .interference import InterferenceReport, measure_interference, signal_retention
 from .merge import CapacityReport, capacity_ratio, fuse, naive_average
 from .rank import RankProfile, activation_covariance, effective_rank, used_subspace
 from .stiefel import (
@@ -25,6 +33,14 @@ __all__ = [
     "interference_ratio",
     "rearrangement_floor",
     "KNEE",
+    "measure_interference",
+    "signal_retention",
+    "InterferenceReport",
+    "functional_rank",
+    "FunctionalRank",
+    "capacity_verdict",
+    "energy_basis",
+    "restrict_to",
     "fuse",
     "naive_average",
     "capacity_ratio",

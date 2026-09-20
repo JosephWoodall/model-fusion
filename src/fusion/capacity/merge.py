@@ -30,7 +30,7 @@ from torch import Tensor
 from ..config import FusionConfig
 from ..model import Transformer, require_same_arch
 from ..symmetry import apply_residual_rotation
-from .rank import RankProfile, participation_ratio, used_subspace
+from .rank import RankProfile, participation_ratio, read_point_covariance, used_subspace
 from .stiefel import (
     KNEE,
     DisentangleResult,
@@ -62,6 +62,14 @@ class CapacityReport:
     interference_after: float = float("nan")
     floor: float = float("nan")
     at_floor: bool = False
+    #: The disentangling rotation applied to each model before summing.
+    #: Needed to compare the merged model against a specialist: after fusion the
+    #: two live in different frames, and a residual-stream comparison across
+    #: frames measures nothing.
+    rotations: list[Tensor] = field(default_factory=list)
+    #: The models as they were summed -- canonicalized and rotated into the
+    #: merged frame. These are what a per-model diagnostic must be run against.
+    aligned: list[Transformer] = field(default_factory=list)
 
     @property
     def rank_coverage(self) -> float:
@@ -196,6 +204,7 @@ def fuse(
             apply_residual_rotation(m, R.to(m.embed), check=False)
         report.overlap_after = res.overlap_after
         report.disentangled = True
+        report.rotations = list(res.rotations)
         bases = [R.to(b) @ b for R, b in zip(res.rotations, bases, strict=True)]
         if weighted:
             report.interference_after = res.interference_after
@@ -205,6 +214,7 @@ def fuse(
         report.overlap_after = report.overlap_before
         report.interference_after = report.interference_before
 
+    report.aligned = models
     if weighted:
         # No rank budget exists any more, so there is nothing for the budget QP
         # to select: every direction is already carried, weighted by its energy.
@@ -227,24 +237,128 @@ def fuse(
     return merged, report
 
 
-@torch.no_grad()
-def _sum_models(models: list[Transformer]) -> Transformer:
-    """Sum the stream-facing weights, average the rest.
+WRITERS = ("embed", "pos", "attn.w_o", "mlp.w_out")
+#: readers, in the order of :func:`fusion.capacity.rank.read_point_states`
+_READERS_PER_BLOCK = (("attn.w_q", "attn.w_k", "attn.w_v"), ("mlp.w_in",))
 
-    Readers (``W_q``, ``W_k``, ``W_v``, ``W_in``, ``U``) are averaged, not
-    summed: a reader restricted to model ``k``'s subspace already ignores the
-    other models' directions, so averaging preserves its response while summing
-    would scale it by N.  Writers are summed, because each writes into its own
-    orthogonal set of directions.
+
+def _is_writer(name: str) -> bool:
+    return any(name.endswith(w) or f".{w}" in name for w in WRITERS)
+
+
+@torch.no_grad()
+def _sum_models(models: list[Transformer], reader_rule: str = "mean") -> Transformer:
+    """Sum the stream-facing weights; combine the readers by ``reader_rule``.
+
+    Writers are always summed -- each writes into its own directions.  For the
+    readers neither fixed rule is correct, and the two degenerate cases show why:
+
+    ===================  ==================  ==================
+    merge                readers averaged    readers summed
+    ===================  ==================  ==================
+    ``m`` with a *zero*  0.43  (broken)      1.00 (correct)
+    ``m`` with a *copy*  1.00  (correct)     0.71 (broken)
+    ===================  ==================  ==================
+
+    Averaging scales every reader by ``1/N`` while the stream keeps its full
+    magnitude, so attention scores shrink by ``N^2`` and the softmax flattens.
+    Summing has the mirror problem when the models genuinely overlap.  The
+    correct weight depends on how much of the merged stream is actually model
+    ``k``'s signal, which is what :func:`_wiener_readers` estimates.  These
+    fixed rules are kept for ablation.
     """
     out = models[0].clone()
     device = next(out.parameters()).device
     named = [dict(m.named_parameters()) for m in models]
-    writers = ("embed", "pos", "attn.w_o", "mlp.w_out")
     for name, p in out.named_parameters():
         stack = torch.stack([n[name].data.to(device=device, dtype=torch.float64) for n in named])
-        is_writer = any(name.endswith(w) or f".{w}" in name for w in writers)
-        p.data = (stack.sum(0) if is_writer else stack.mean(0)).to(p.dtype)
+        take_sum = _is_writer(name) or reader_rule == "sum"
+        p.data = (stack.sum(0) if take_sum else stack.mean(0)).to(p.dtype)
+    return out
+
+
+@torch.no_grad()
+def _wiener_readers(
+    models: list[Transformer],
+    calib_tokens: list[Tensor],
+    eps: float = 1e-10,
+) -> Transformer:
+    """Sum the writers; give each reader the signal it was trained to see.
+
+    The merged stream carries ``h = sum_j h_j``.  Model ``k``'s reader wants
+    ``h_k``, and the minimum-mean-squared-error linear estimate of it is the
+    Wiener filter
+
+        h_k_hat = h (sum_j C_j + eps I)^-1 C_k
+
+    so the merged reader is ``W = sum_k (sum_j C_j)^-1 C_k W^(k)``.  Applied to
+    the merged stream, each model's own reader sees its own signal and nothing
+    else, to the extent the covariances are separable -- which is exactly what
+    Phase 2's disentangling is trying to arrange.
+
+    This subsumes both fixed rules rather than splitting the difference:
+    against a zero model ``P_k -> I`` and it becomes a sum; against an identical
+    copy ``P_k -> I/N`` and it becomes a mean.  No threshold or rank appears.
+
+    Covariances are taken **per read point**, not per layer boundary: the
+    attention and MLP blocks of one layer read the stream at different points,
+    so one projector for both is the wrong projector for half the readers.
+
+    ``eps`` is a relative eigenvalue tolerance for the pseudo-inverse -- a
+    numerical rank cutoff, not a modeling knob.  Results are flat across many
+    orders of magnitude of it; ``tests/test_combine_rule.py`` pins that, because
+    a rule that only works at one ``eps`` would be a tuning artifact.
+    """
+    n = len(models)
+    out = models[0].clone()
+    device = next(out.parameters()).device
+
+    # covs[k][i] = model k's second moment at read point i, on model k's own data
+    # Uncentered second moments, NOT covariances.  The projector has to
+    # reconstruct ``h`` itself, and centering would leave it blind along the
+    # mean direction -- which is a real, functionally load-bearing component of
+    # the residual stream, so zeroing the readers there destroys the model.
+    covs = [
+        read_point_covariance(m, t.to(device), center=False)
+        for m, t in zip(models, calib_tokens, strict=True)
+    ]
+    n_points = len(covs[0])
+    projectors = []
+    for i in range(n_points):
+        total = sum(covs[k][i] for k in range(n))
+        # Pseudo-inverse, not a ridge.  The pooled second moment is genuinely
+        # rank deficient -- at the first read point the stream spans only
+        # V + T directions -- and on that null space *no* model has any signal,
+        # so dropping it is exact rather than approximate.  A ridge instead
+        # leaks a tunable amount of suppression into the live directions, which
+        # would make the result an artifact of eps.
+        evals, evecs = torch.linalg.eigh(total)
+        keep = evals > evals.max().clamp_min(1e-300) * eps
+        inv_evals = torch.where(keep, 1.0 / evals.clamp_min(1e-300), torch.zeros_like(evals))
+        inv = (evecs * inv_evals[None, :]) @ evecs.T
+        projectors.append([inv @ covs[k][i] for k in range(n)])
+
+    named = [dict(m.named_parameters()) for m in models]
+
+    def blended(name: str, point: int) -> Tensor:
+        return sum(
+            projectors[point][k].to(torch.float64) @ named[k][name].data.double()
+            for k in range(n)
+        )
+
+    for name, p in out.named_parameters():
+        if _is_writer(name):
+            p.data = torch.stack([nm[name].data.double() for nm in named]).sum(0).to(p.dtype)
+    for layer in range(out.cfg.n_layers):
+        for offset, group in enumerate(_READERS_PER_BLOCK):
+            point = 2 * layer + offset
+            for suffix in group:
+                name = f"blocks.{layer}.{suffix}"
+                dict(out.named_parameters())[name].data = blended(name, point).to(
+                    out.embed.dtype
+                )
+    if out.unembed is not None:
+        out.unembed.data = blended("unembed", n_points - 1).to(out.embed.dtype)
     return out
 
 
