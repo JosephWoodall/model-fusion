@@ -1,0 +1,23 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# artifacts
+checkpoints/
+runs/
+outputs/
+wandb/
+*.pt
+*.ckpt
+*.npz
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/
