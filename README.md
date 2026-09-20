@@ -24,12 +24,23 @@ The central claim under test:
 > rank of model *k*'s residual-stream activations and *d* is the residual width.
 
 That is a scaling law rather than a heuristic, and it generalizes over arbitrary *N* by
-construction. The intended headline result is degradation plotted against Σr<sub>k</sub>/d, with
-a predicted knee at 1.0.
+construction — **provided r<sub>k</sub> means the right thing.** It took three attempts to find a
+definition that does, and that search is the main result here so far:
 
-**It is not yet testable**, and the reason is a result in itself: no available definition of
-r<sub>k</sub> is simultaneously threshold-free and energy-complete, so the x-axis is either
-trivially satisfied or never satisfied. [See below](#capacity-the-law-is-untested-and-the-blocker-is-r_k).
+| definition of r<sub>k</sub> | problem |
+|---|---|
+| eigenvalues above an energy threshold | the threshold picks the answer (39 / 98 / 124 at 0.90 / 0.99 / 0.999) |
+| participation ratio `(Σλ)²/Σλ²` | threshold-free but far too generous: every cell "feasible", every merge at chance |
+| energy-weighted overlap, full spectrum | no cutoff at all, and **still wrong** — energy is not importance |
+| **functional rank** `r_f(τ)` | smallest *r* whose top-*r* directions retain τ of the model's accuracy |
+
+The measurement that forced the last row: confining a grokked model to its top 64 of 128
+directions keeps **92.7% of the activation energy and 0.48 of the accuracy**. Full accuracy needs
+112. The last 1% of energy, spread over ~40 low-variance directions, is worth 50 points — because
+it takes very little energy to move a decision boundary.
+
+So every *spectral* rank is blind to exactly the directions that decide the computation.
+[See below](#capacity-what-r_k-had-to-become).
 
 ## Why train from scratch
 
@@ -146,38 +157,71 @@ group.
 Right column: nothing recovers anything, for the Control B reason above. Reported rather than
 omitted.
 
-## Capacity: the law is untested, and the blocker is `r_k`
+## Capacity: what `r_k` had to become
 
-The capacity law needs a well-defined `r_k`. Neither available measure is one.
+### The energy-weighted objective
 
-A **thresholded** effective rank is set by its threshold — one modular-addition model at `d=128`:
+The rank cutoff is gone. With `M_k = R_k U_k Λ_k^{1/2}` and `A_k = M_k M_kᵀ = R_k C_k R_kᵀ`:
 
-| energy threshold | 0.90 | 0.99 | 0.999 |
+> minimize over orthogonal `R_1..R_N`: `Σ_{j≠k} ‖M_kᵀ M_j‖²_F = Σ_{j≠k} tr(A_k A_j)`
+
+Each direction contributes in proportion to the energy on it, rather than counting as a whole
+dimension or being discarded. A **rearrangement floor** (the per-pair minimum, by the
+rearrangement inequality) says whether a high residual overlap is the spectra's fault or the
+solver's — without it, a stalled optimizer is indistinguishable from a capacity limit.
+
+Predicted knee: interference `max_k Σ_{j≠k} tr(A_kA_j)/tr(A_k²)` = 1.0, i.e. 0 dB.
+
+**That prediction is falsified.** At `d=128`, with both sides of the knee populated for the first
+time, worst-task accuracy is 0.021 below it and 0.020 above — chance everywhere. At `N=2` the
+solver is *provably at the floor* with a 17 dB interference margin and the merge is still dead.
+
+### Two bugs the instrumentation caught
+
+Both produced the signature of a capacity limit while having nothing to do with capacity.
+
+**The combine rule.** Writers were summed while readers were averaged, so readers were scaled by
+`1/N` while the stream kept its magnitude — attention scores shrink by `N²` and the softmax
+flattens. Merging a model with a **literally zero** model cost 57 points of accuracy:
+
+| merge | readers averaged | readers summed | Wiener |
 |---|---|---|---|
-| effective rank | 39 | 98 | 124 |
+| `m` + zero model | 0.43 | 1.00 | **1.00** |
+| `m` + copy of itself | 1.00 | 0.71 | **1.00** |
 
-The knob picks the answer, and with it the predicted knee. The **participation ratio**
-`(Σλ)² / Σλ²` has no knob and lands at ~11 for the same model — but it is far too generous. At
-`d=64` the participation basis captures only **75% of activation energy**, and disentangling it
-to *exactly zero* overlap leaves the 99%-energy bases still overlapping at 0.77.
+No fixed rule passes both. The Wiener estimate `ĥ_k = h (Σ_j C_j)⁺ C_k` does, reducing to a sum
+against a zero model and a mean against a duplicate.
 
-Measured consequence, `d=256`, participation-ratio rank (chance = 0.021):
+**Centering.** That projector must use *uncentered* second moments. Built from covariances it is
+blind along the residual stream's mean direction, which is load-bearing, so it zeroes the readers
+exactly where they carry signal. There is now a regression test for it.
 
-| N | Σr/d | feasible | overlap after disentangling | fused | ceiling |
-|---|------|----------|------------------------------|-------|---------|
-| 2 | 0.18 | yes | 0.0000 | 0.030 | 1.000 |
-| 4 | 0.33 | yes | 0.0000 | 0.017 | 1.000 |
-| 8 | 0.67 | yes | 0.0000 | 0.012 | 1.000 |
+### Functional rank, and the first non-chance merge
 
-Every cell passes the capacity test, the subspaces really are made mutually orthogonal, and every
-merge is at chance. The strict measure has the mirror problem: no cell is ever feasible. Neither
-bracket contains a transition, so **`Σr_k ≤ d` is neither confirmed nor refuted here** and the
-headline knee plot has no defensible x-axis yet.
+`r_f(τ)` = smallest `r` whose top-`r` directions retain `τ` of the model's accuracy, by bisection.
+`τ` is a knob, but a *behavioral* one. It **saturates with width**:
 
-`RankProfile.energy_captured` now reports what fraction of activation energy any rank accounts
-for, and the capacity report prints a `CAVEAT` below 95%. The next step is an energy-weighted
-overlap objective that removes the cutoff from the method entirely — see
-[`docs/FINDINGS.md`](docs/FINDINGS.md).
+| d | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|
+| `r_f(0.99)` | 61 | 93 | 72 | 67 |
+| `r_f/d` | 0.95 | 0.73 | 0.28 | 0.13 |
+
+A fixed ~60–95 directions however wide the stream is — so `Σ_k r_f ≤ d` is reachable by widening,
+which makes the law satisfiable rather than vacuous. Testing it at `N=2` (chance = 0.021):
+
+| d | Σr_f/d | verdict | naive | Wiener | Wiener + repair |
+|---|---|---|---|---|---|
+| 128 | 1.42 | OVER CAPACITY | 0.014 | 0.020 | 0.024 |
+| 256 | 0.62 | feasible | 0.028 | 0.042 | **0.073** |
+| 512 | 0.22 | feasible | 0.035 | 0.034 | 0.025 |
+
+The middle row briefly looked like the first confirming evidence in the project. **The `d=512` row
+kills that reading**: it is *more* feasible and back at chance. If feasibility were driving the
+`d=256` result, `d=512` should have been at least as good.
+
+So `0.073` is an unreplicated bump, not a knee — one seed, contradicted by the next point along
+the same axis. The functional-rank restatement is better *posed* than anything before it, and it
+is **not confirmed**. Details and next steps in [`docs/FINDINGS.md`](docs/FINDINGS.md).
 
 ## Evaluation is adversarial on purpose
 
@@ -211,10 +255,13 @@ pytest -q            # invariance tests: the symmetry transforms must be exact
 
 - **Phase 1 is validated and exact.** A planted rotation is recovered to float32 precision and the
   barrier goes to 0.000000, which no permutation-based baseline comes close to.
-- **Phase 2's central claim is untested**, blocked on a rank measure that is simultaneously
-  threshold-free and energy-complete.
-- **No merge in this repo yet works on independently trained models.** Every one sits at chance.
-  That is the honest state, and the diagnostics say which phase to look at next.
+- **The interference-ratio knee is falsified**, and the energy-weighted axis with it: energy does
+  not measure importance.
+- **The capacity law restated over functional rank is better posed, and still unconfirmed.** Its
+  one promising cell does not replicate at a more feasible width.
+- **No merge here works on independently trained models.** The best is 0.073 against a ceiling of
+  1.000, and it does not reproduce. That is the honest state; the diagnostics now say the
+  optimizer is arranging the wrong subspaces, which is the next thing to fix.
 
 ## Layout
 
@@ -225,7 +272,8 @@ src/fusion/
   tasks.py          task suite with a relatedness dial
   train.py          specialist training
   align/            canonicalization + published baselines
-  capacity/         effective rank, Stiefel disentangling, budgeted merge
+  capacity/         rank (spectral and functional), energy-weighted disentangling,
+                    Wiener combine rule, interference diagnostics
   repair.py         REPAIR-style gain refitting
   evaluation/       barrier, CKA, overlap, the grid harness
   baselines/        distillation, router, joint training

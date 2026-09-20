@@ -205,3 +205,165 @@ should never again be quoted as if it described the subspace the model uses.
 3. Only then does the `Σr_k/d = 1` knee become a claim that can fail.
 
 Until then the headline plot has no defensible x-axis and is not reported.
+
+---
+
+## 2026-09-20 — Phase 2 rebuilt: the objective, two bugs, and the first working merge
+
+The hard rank cutoff was replaced with an energy-weighted overlap objective, as
+planned. That change was necessary and not sufficient: instrumenting the sweep
+turned up two defects that had been producing the *signature* of a capacity
+limit, and one wrong premise underneath the whole phase.
+
+### The new objective works as designed
+
+With `M_k = R_k U_k Λ_k^{1/2}` and `A_k = M_k M_kᵀ`, minimizing
+`Σ_{j≠k} tr(A_k A_j)` over the full spectrum. Adding the **rearrangement floor**
+(the per-pair minimum, by the rearrangement inequality) showed the solver was
+the limit, not capacity: random initialization stalled well above it. The
+spectral warm start — anti-aligning the spectra, exactly optimal for `N = 2` —
+reaches the floor to five decimals.
+
+Sweep at `d=128`, high overlap, `N ∈ {2,…,16}`, chance = 0.021:
+
+| N | interference | floor | at floor | worst-task, fused | ceiling |
+|---|---|---|---|---|---|
+| 2 | **0.019** | 0.0170 | **yes** | 0.022 | 1.000 |
+| 3 | 0.130 | 0.0177 | no | 0.021 | 1.000 |
+| 8 | 0.634 | 0.0112 | no | 0.021 | 1.000 |
+| 12 | 1.090 | 0.0118 | no | 0.016 | 1.000 |
+| 16 | 1.563 | 0.0110 | no | 0.018 | 1.000 |
+
+For the first time both sides of the predicted knee are populated — and there
+is **no knee**. 0.021 below, 0.020 above. At `N=2` the solver is provably at the
+floor with a 17 dB interference margin, and the merge is still at chance.
+
+### Bug 1 — the combine rule was broken independently of any geometry
+
+Writers were summed while readers were averaged, so readers were scaled by
+`1/N` while the stream kept its magnitude. Attention scores shrink by `N²` and
+the softmax flattens.
+
+Two degenerate merges, both with a known right answer:
+
+| merge | readers averaged | readers summed | Wiener |
+|---|---|---|---|
+| `m` with a **zero** model | 0.43 | 1.00 | **1.00** |
+| `m` with a **copy** of itself | 1.00 | 0.71 | **1.00** |
+
+Merging with a model that contributes *literally nothing* cost 57 points. No
+fixed rule passes both cases, because the correct reader weight depends on how
+much of the merged stream is actually that model's signal. The Wiener estimate
+`ĥ_k = h (Σ_j C_j)⁺ C_k` supplies exactly that, reducing to a sum against a
+zero model and a mean against a duplicate.
+
+### Bug 2 — the projector must use uncentered second moments
+
+Built from *covariances*, the Wiener projector is blind along the residual
+stream's mean direction, which is load-bearing, so it zeroes the readers
+precisely where they carry signal. From the outside this was indistinguishable
+from a capacity limit. Regression test: `test_centering_the_projector_destroys_the_model`.
+
+The pooled moment is also genuinely rank-deficient — at the first read point the
+stream spans only `V + T` of `d` directions — so the inverse is a pseudo-inverse
+rather than a ridge. Results are now flat across ten orders of magnitude of the
+tolerance instead of tuned to one value.
+
+Fixing both was necessary and still not sufficient: the merge stayed at chance.
+
+### The wrong premise — activation energy is not importance
+
+Confining a single grokked model's writes to its top-`r` energy directions,
+`d=128`:
+
+| directions | energy kept | accuracy |
+|---|---|---|
+| 64 | 92.7% | 0.48 |
+| 80 | 95.7% | 0.82 |
+| 96 | 97.8% | 0.99 |
+| 112 | 99.1% | 1.00 |
+
+**93% of the energy is worth less than half the accuracy.** The last 1%, spread
+over ~40 directions, carries the rest. It takes very little energy to move a
+decision boundary, so a low-variance direction can be functionally critical.
+
+This is why the weighted objective reports 0.019 interference on a merge that
+is at chance: it weights by energy, and the functionally decisive directions
+carry almost none. Every spectral rank — thresholded, participation, or
+energy-weighted — is blind to exactly what matters. That was the real blocker
+all along, and neither cutoff was the problem.
+
+### Functional rank, and the first non-chance merge
+
+Replace the spectral rank with a behavioral one:
+
+> `r_f(τ)` = the smallest `r` such that confining the model's writes to its top
+> `r` directions retains `τ` of its accuracy.
+
+`τ` is a knob, but a *behavioral* one — "how much accuracy am I willing to
+lose" has a meaningful answer, unlike "what eigenvalue counts as zero". Found by
+bisection in `O(log d)` evaluations.
+
+It **saturates with width**:
+
+| d | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|
+| `r_f(0.99)` | 61 | 93 | 72 | 67 |
+| `r_f/d` | 0.95 | 0.73 | 0.28 | 0.13 |
+
+The task needs a roughly fixed ~60–95 directions however wide the stream is.
+So `Σ_k r_f` can be brought under `d` by widening — and the capacity law becomes
+satisfiable rather than vacuous or unreachable.
+
+Testing that prediction, `N=2`, high overlap, chance = 0.021:
+
+| d | Σr_f/d | verdict | naive | Wiener | Wiener+repair |
+|---|---|---|---|---|---|
+| 128 | 1.42 | OVER CAPACITY | 0.014 | 0.020 | 0.024 |
+| 256 | 0.62 | feasible | 0.028 | 0.042 | **0.073** |
+| 512 | 0.22 | feasible | 0.035 | 0.034 | 0.025 |
+
+The middle row looked, for about twenty minutes, like the first confirming
+evidence in the project: an over-capacity cell at chance and a feasible cell at
+3.5× chance, on the side of the boundary the law predicts.
+
+**The `d=512` row kills that reading.** It is *more* feasible than `d=256`
+(0.22 against 0.62) and it is back at chance. If feasibility were driving the
+`d=256` result, `d=512` should have been at least as good. It is not.
+
+So `0.073` is an unreplicated bump, not a knee. One point, one seed, and the
+trend it suggested is contradicted by the next point along the same axis.
+
+### Status of the prediction
+
+The knee at interference = 1.0 is **falsified**: no transition at that value, or
+anywhere on that axis, because the axis is energy-weighted and energy is the
+wrong variable.
+
+The replacement — `Σ_k r_f(τ) ≤ d` over the behavioral rank — is **not
+confirmed either**. It is better posed than anything before it, which is real
+progress, but the three points available are consistent with the merge simply
+being at chance everywhere and `d=256` being noise.
+
+**There is still no working merge of independently trained models in this
+repo, and no located knee.** The honest summary of this round: the objective
+is now cutoff-free, two real bugs are fixed, the premise that energy measures
+importance is refuted with direct evidence, and the capacity law finally has a
+well-posed statement — none of which has yet produced a merge that works.
+
+### Open
+
+- **Seeds, before anything else.** Every cell above is a single seed. `0.073`
+  versus `0.025` is exactly the size of difference that needs error bars before
+  it is worth interpreting, and the same applies to the non-monotone `r_f` at
+  `d=128` (93, against 61 / 72 / 67 at the other widths).
+- **Disentangle over the functional basis, not the energy basis.** The capacity
+  *test* now uses `r_f`, but the optimizer still minimizes overlap between
+  energy-weighted covariances — the very proxy shown above to be blind to the
+  directions that matter. Feasibility by counting cannot pay off while the
+  solver is arranging the wrong subspaces. This is the single most likely reason
+  the feasible cells are still at chance, and it is the next thing to build.
+- The functional directions are not simply "the top-`r_f` energy directions"
+  either; `restrict_to` uses the energy basis to *order* candidates, which is
+  convenient rather than principled. A basis selected by ablation directly
+  (greedy or gradient-based) would be the honest version.
