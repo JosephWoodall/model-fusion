@@ -24,8 +24,12 @@ The central claim under test:
 > rank of model *k*'s residual-stream activations and *d* is the residual width.
 
 That is a scaling law rather than a heuristic, and it generalizes over arbitrary *N* by
-construction. The headline result is degradation plotted against Σr<sub>k</sub>/d, with a
-predicted knee at 1.0.
+construction. The intended headline result is degradation plotted against Σr<sub>k</sub>/d, with
+a predicted knee at 1.0.
+
+**It is not yet testable**, and the reason is a result in itself: no available definition of
+r<sub>k</sub> is simultaneously threshold-free and energy-complete, so the x-axis is either
+trivially satisfied or never satisfied. [See below](#capacity-the-law-is-untested-and-the-blocker-is-r_k).
 
 ## Why train from scratch
 

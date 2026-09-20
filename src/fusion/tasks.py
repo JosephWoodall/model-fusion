@@ -199,7 +199,17 @@ class Sort(Task):
 
 
 class Copy(Task):
-    """Induction/copy: emit the block that followed the first occurrence of the cue."""
+    """Copy the operand block verbatim.
+
+    The simplest thing an induction head can do: attend back to the operand
+    positions and emit what is there.  It is deliberately *not* a full induction
+    task (match a cue, emit what followed it) -- that would need a longer
+    context than the shared sequence format allows, and a different format per
+    task would confound the capacity question with a tokenization question.
+    What it does share with induction is the circuit shape: previous-token
+    attention plus copying, with no arithmetic structure at all, which is what
+    makes it the right member of the ``disjoint`` group.
+    """
 
     name = "copy"
     n_operands = 5
